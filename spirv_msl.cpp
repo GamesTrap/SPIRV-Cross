@@ -73,6 +73,17 @@ void CompilerMSL::add_discrete_descriptor_set(uint32_t desc_set)
 		argument_buffer_discrete_mask |= 1u << desc_set;
 }
 
+void CompilerMSL::set_argument_buffer_device_address_space(uint32_t desc_set, bool device_storage)
+{
+	if (desc_set < kMaxArgumentBuffers)
+	{
+		if (device_storage)
+			argument_buffer_device_storage_mask |= 1u << desc_set;
+		else
+			argument_buffer_device_storage_mask &= ~(1u << desc_set);
+	}
+}
+
 bool CompilerMSL::is_msl_vertex_attribute_used(uint32_t location)
 {
 	return vtx_attrs_in_use.count(location) != 0;
@@ -6585,6 +6596,14 @@ string CompilerMSL::to_function_args(VariableID img, const SPIRType &imgtype, bo
 		else if (sampling_type_needs_f32_conversion(coord_type))
 			tex_coords = convert_to_f32(tex_coords, 1);
 
+		if (msl_options.texture_1D_as_2D)
+		{
+			if (is_fetch)
+				tex_coords = "uint2(" + tex_coords + ", 0)";
+			else
+				tex_coords = "float2(" + tex_coords + ", 0.5)";
+		}
+
 		alt_coord_component = 1;
 		break;
 
@@ -6776,14 +6795,14 @@ string CompilerMSL::to_function_args(VariableID img, const SPIRType &imgtype, bo
 
 	// LOD Options
 	// Metal does not support LOD for 1D textures.
-	if (bias && imgtype.image.dim != Dim1D)
+	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
 	{
 		forward = forward && should_forward(bias);
 		farg_str += ", bias(" + to_expression(bias) + ")";
 	}
 
 	// Metal does not support LOD for 1D textures.
-	if (lod && imgtype.image.dim != Dim1D)
+	if (lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
 	{
 		forward = forward && should_forward(lod);
 		if (is_fetch)
@@ -6795,8 +6814,8 @@ string CompilerMSL::to_function_args(VariableID img, const SPIRType &imgtype, bo
 			farg_str += ", level(" + to_expression(lod) + ")";
 		}
 	}
-	else if (is_fetch && !lod && imgtype.image.dim != Dim1D && imgtype.image.dim != DimBuffer && !imgtype.image.ms &&
-	         imgtype.image.sampled != 2)
+	else if (is_fetch && !lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D) &&
+	         imgtype.image.dim != DimBuffer && !imgtype.image.ms && imgtype.image.sampled != 2)
 	{
 		// Lod argument is optional in OpImageFetch, but we require a LOD value, pick 0 as the default.
 		// Check for sampled type as well, because is_fetch is also used for OpImageRead in MSL.
@@ -6804,7 +6823,7 @@ string CompilerMSL::to_function_args(VariableID img, const SPIRType &imgtype, bo
 	}
 
 	// Metal does not support LOD for 1D textures.
-	if ((grad_x || grad_y) && imgtype.image.dim != Dim1D)
+	if ((grad_x || grad_y) && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
 	{
 		forward = forward && should_forward(grad_x);
 		forward = forward && should_forward(grad_y);
@@ -8950,7 +8969,13 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
 				// constant SSBO * constant (&array)[N].
 				// However, this only matters for argument buffers, since for MSL 1.0 style codegen,
 				// we emit the buffer array on stack instead, and that seems to work just fine apparently.
-				decl += " constant";
+
+				// If the argument was marked as being in device address space, any pointer to member would
+				// be const device, not constant.
+				if (argument_buffer_device_storage_mask & (1u << desc_set))
+					decl += " const device";
+				else
+					decl += " constant";
 			}
 		}
 
@@ -9530,8 +9555,13 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id)
 		switch (img_type.dim)
 		{
 		case Dim1D:
-			img_type_name += "depth1d_unsupported_by_metal";
-			break;
+			if (!msl_options.texture_1D_as_2D)
+			{
+				// Use a native Metal 1D texture
+				img_type_name += "depth1d_unsupported_by_metal";
+				break;
+			}
+			// else fall through and use 2D
 		case Dim2D:
 			if (img_type.ms && img_type.arrayed)
 			{
@@ -9561,9 +9591,6 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id)
 	{
 		switch (img_type.dim)
 		{
-		case Dim1D:
-			img_type_name += (img_type.arrayed ? "texture1d_array" : "texture1d");
-			break;
 		case DimBuffer:
 			if (img_type.ms || img_type.arrayed)
 				SPIRV_CROSS_THROW("Cannot use texel buffers with multisampling or array layers.");
@@ -9577,6 +9604,14 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id)
 			else
 				img_type_name += "texture2d";
 			break;
+		case Dim1D:
+			if (!msl_options.texture_1D_as_2D)
+			{
+				// Use a native Metal 1D texture
+				img_type_name += (img_type.arrayed ? "texture1d_array" : "texture1d");
+				break;
+			}
+			// else fall through and use 2D
 		case Dim2D:
 		case DimSubpassData:
 			if (img_type.ms && img_type.arrayed)
@@ -11213,8 +11248,20 @@ void CompilerMSL::analyze_argument_buffers()
 		argument_buffer_ids[desc_set] = next_id;
 
 		auto &buffer_type = set<SPIRType>(type_id);
-		buffer_type.storage = StorageClassUniform;
+
 		buffer_type.basetype = SPIRType::Struct;
+
+		if ((argument_buffer_device_storage_mask & (1u << desc_set)) != 0)
+		{
+			buffer_type.storage = StorageClassStorageBuffer;
+			// Make sure the argument buffer gets marked as const device.
+			set_decoration(next_id, DecorationNonWritable);
+			// Need to mark the type as a Block to enable this.
+			set_decoration(type_id, DecorationBlock);
+		}
+		else
+			buffer_type.storage = StorageClassUniform;
+
 		set_name(type_id, join("spvDescriptorSetBuffer", desc_set));
 
 		auto &ptr_type = set<SPIRType>(ptr_type_id);
