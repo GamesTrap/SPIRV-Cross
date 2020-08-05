@@ -267,7 +267,6 @@ string CompilerReflection::compile()
 	json_stream = std::make_shared<simple_json::Stream>();
 	json_stream->set_current_locale_radix_character(current_locale_radix_character);
 	json_stream->begin_json_object();
-	fixup_type_alias();
 	reorder_type_alias();
 	emit_entry_points();
 	emit_types();
@@ -305,8 +304,8 @@ void CompilerReflection::emit_types()
 		else if (type_is_reference(type))
 		{
 			if (!naturally_emit_type(this->get<SPIRType>(type.parent_type)) &&
-			    find(physical_pointee_types.begin(), physical_pointee_types.end(),
-			         type.parent_type) == physical_pointee_types.end())
+			    find(physical_pointee_types.begin(), physical_pointee_types.end(), type.parent_type) ==
+			        physical_pointee_types.end())
 			{
 				physical_pointee_types.push_back(type.parent_type);
 			}
@@ -326,9 +325,6 @@ void CompilerReflection::emit_type(uint32_t type_id, bool &emitted_open_tag)
 {
 	auto &type = get<SPIRType>(type_id);
 	auto name = type_to_glsl(type);
-
-	if (type.type_alias != TypeID(0))
-		return;
 
 	if (!emitted_open_tag)
 	{
